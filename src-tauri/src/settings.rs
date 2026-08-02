@@ -354,6 +354,10 @@ pub struct AppSettings {
     /// key mid-hold. Off by default.
     #[serde(default = "default_push_to_talk_hands_free")]
     pub push_to_talk_hands_free: bool,
+    /// Whether the user has ever latched a hands-free recording. Once set, the
+    /// overlay stops offering the hands-free hint during long holds.
+    #[serde(default)]
+    pub hands_free_used: bool,
     #[serde(default)]
     pub audio_feedback: bool,
     #[serde(default = "default_audio_feedback_volume")]
@@ -871,6 +875,7 @@ pub fn get_default_settings() -> AppSettings {
         bindings,
         push_to_talk: default_push_to_talk(),
         push_to_talk_hands_free: default_push_to_talk_hands_free(),
+        hands_free_used: false,
         audio_feedback: false,
         audio_feedback_volume: default_audio_feedback_volume(),
         sound_theme: default_sound_theme(),
@@ -936,6 +941,14 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// Post-processing only works while experimental features are enabled: its
+    /// toggle lives in the experimental section, so switching that section off
+    /// must switch the feature off too, even though `post_process_enabled`
+    /// keeps its value for when the section comes back.
+    pub fn post_process_active(&self) -> bool {
+        self.post_process_enabled && self.experimental_enabled
+    }
+
     pub fn active_post_process_provider(&self) -> Option<&PostProcessProvider> {
         self.post_process_providers
             .iter()

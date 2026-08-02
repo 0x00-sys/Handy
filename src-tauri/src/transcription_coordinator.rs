@@ -24,8 +24,9 @@ const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(300);
 const DOUBLE_TAP_MIN_GAP: Duration = Duration::from_millis(40);
 
 /// How long the shortcut must be held before the overlay offers the hands-free
-/// key: long enough that ordinary dictation never sees the hint.
-const HANDS_FREE_HINT_DELAY: Duration = Duration::from_millis(5000);
+/// key: long enough that ordinary dictation never sees the hint. Once the user
+/// has latched hands-free at least once the hint is never shown again.
+const HANDS_FREE_HINT_DELAY: Duration = Duration::from_millis(10_000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PttAction {
@@ -110,6 +111,12 @@ enum Stage {
         /// Hands-free: the shortcut is no longer holding the recording open,
         /// so releases are ignored and the next press stops it.
         latched: bool,
+        /// Post-process the transcript when this recording ends. Set when the
+        /// post-process binding started the recording, or when it fired while
+        /// another binding was already recording — its combo may share its
+        /// leading keys with the transcribe binding, which then always wins
+        /// the initial press (e.g. `option` vs `option+shift+space`).
+        post_process: bool,
     },
     Processing,
 }
@@ -120,6 +127,7 @@ impl Stage {
             Stage::Recording {
                 binding_id,
                 latched,
+                ..
             } => Some((binding_id.as_str(), *latched)),
             _ => None,
         }
@@ -203,9 +211,38 @@ fn stops_recording(stage: &Stage, binding_id: &str, is_pressed: bool) -> bool {
         Stage::Recording {
             binding_id: id,
             latched,
+            ..
         } => id == binding_id && *latched == is_pressed,
         _ => false,
     }
+}
+
+/// A press of one transcribe binding while the other holds the recording open.
+/// The two combos may share their leading keys (`option` for push-to-talk and
+/// `option+shift+space` for post-processing), so the shorter one always wins
+/// the initial press and the longer one can only ever fire mid-recording.
+/// Retarget the in-flight recording to the incoming binding's mode instead of
+/// ignoring the press. Returns whether the press was consumed.
+fn switch_transcribe_mode(stage: &mut Stage, incoming: &str) -> bool {
+    let Stage::Recording {
+        binding_id,
+        post_process,
+        ..
+    } = stage
+    else {
+        return false;
+    };
+    if binding_id == incoming {
+        return false;
+    }
+    let want = incoming == "transcribe_with_post_process";
+    if *post_process != want {
+        *post_process = want;
+        debug!(
+            "Recording held by '{binding_id}' retargeted by '{incoming}' (post_process: {want})"
+        );
+    }
+    true
 }
 
 /// Serialises all transcription lifecycle events through a single thread
@@ -251,7 +288,11 @@ impl TranscriptionCoordinator {
 
                                 if hint_deadline.is_some_and(|at| at <= now) {
                                     hint_deadline = None;
-                                    if matches!(stage.recording(), Some((_, false))) {
+                                    // Once the user has latched hands-free they
+                                    // know the feature exists — stop hinting.
+                                    if matches!(stage.recording(), Some((_, false)))
+                                        && !crate::settings::get_settings(&app).hands_free_used
+                                    {
                                         if let Some(key) = crate::shortcut::active_hands_free_key()
                                         {
                                             crate::overlay::emit_hands_free_hint(&app, &key);
@@ -373,9 +414,15 @@ impl TranscriptionCoordinator {
                                     hint_deadline = None;
                                     hold_started = None;
                                     stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                } else if is_pressed {
+                                    // The other transcribe binding fired while a
+                                    // recording is in flight (its combo shares
+                                    // keys with the one holding it): retarget
+                                    // the recording instead of dropping it.
+                                    switch_transcribe_mode(&mut stage, &binding_id);
                                 }
                             } else if is_pressed {
-                                match &stage {
+                                match &mut stage {
                                     Stage::Idle => {
                                         start(&app, &mut stage, &binding_id, &hotkey_string);
                                     }
@@ -385,6 +432,9 @@ impl TranscriptionCoordinator {
                                         hint_deadline = None;
                                         hold_started = None;
                                         stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                    }
+                                    Stage::Recording { .. } => {
+                                        switch_transcribe_mode(&mut stage, &binding_id);
                                     }
                                     _ => {
                                         debug!("Ignoring press for '{binding_id}': pipeline busy")
@@ -493,6 +543,7 @@ fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &s
         *stage = Stage::Recording {
             binding_id: binding_id.to_string(),
             latched: false,
+            post_process: binding_id == "transcribe_with_post_process",
         };
     } else {
         debug!("Start for '{binding_id}' did not begin recording; staying idle");
@@ -500,8 +551,17 @@ fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &s
 }
 
 fn stop(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str) {
-    let Some(action) = ACTION_MAP.get(binding_id) else {
-        warn!("No action in ACTION_MAP for '{binding_id}'");
+    // The action decides whether the transcript is post-processed; the audio
+    // manager matches on the binding that started the recording, so the
+    // original binding_id is still what gets passed to the action.
+    let action_id = match stage {
+        Stage::Recording {
+            post_process: true, ..
+        } => "transcribe_with_post_process",
+        _ => binding_id,
+    };
+    let Some(action) = ACTION_MAP.get(action_id) else {
+        warn!("No action in ACTION_MAP for '{action_id}'");
         return;
     };
     action.stop(app, binding_id, hotkey_string);
@@ -525,6 +585,12 @@ fn latch(app: &AppHandle, stage: &mut Stage) -> bool {
     debug!("Push-to-talk hold latched into hands-free recording");
     crate::shortcut::unregister_hands_free_shortcut(app);
     crate::overlay::emit_hands_free_active(app);
+    // First real use: the overlay hint has done its job, never show it again.
+    let mut settings = crate::settings::get_settings(app);
+    if !settings.hands_free_used {
+        settings.hands_free_used = true;
+        crate::settings::write_settings(app, settings);
+    }
     true
 }
 
@@ -620,6 +686,60 @@ mod tests {
             }),
             PttAction::CancelRelease
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Transcribe-mode switching (overlapping bindings, e.g. `option` holding
+    // the recording while `option+shift+space` fires mid-hold)
+    // ---------------------------------------------------------------------
+
+    const POST_PROCESS_BINDING: &str = "transcribe_with_post_process";
+
+    fn recording(binding_id: &str, post_process: bool) -> Stage {
+        Stage::Recording {
+            binding_id: binding_id.to_string(),
+            latched: false,
+            post_process,
+        }
+    }
+
+    fn stage_post_process(stage: &Stage) -> Option<bool> {
+        match stage {
+            Stage::Recording { post_process, .. } => Some(*post_process),
+            _ => None,
+        }
+    }
+
+    /// The post-process combo fired while the plain transcribe binding holds
+    /// the recording: the recording is retargeted, not ignored.
+    #[test]
+    fn post_process_press_upgrades_an_in_flight_transcribe_recording() {
+        let mut stage = recording(BINDING, false);
+        assert!(switch_transcribe_mode(&mut stage, POST_PROCESS_BINDING));
+        assert_eq!(stage_post_process(&stage), Some(true));
+        // The owner of the hold is unchanged, so its release still stops it.
+        assert!(stops_recording(&stage, BINDING, false));
+    }
+
+    /// Symmetric overlap: transcribe firing during a post-process hold drops
+    /// back to a plain transcription.
+    #[test]
+    fn transcribe_press_downgrades_an_in_flight_post_process_recording() {
+        let mut stage = recording(POST_PROCESS_BINDING, true);
+        assert!(switch_transcribe_mode(&mut stage, BINDING));
+        assert_eq!(stage_post_process(&stage), Some(false));
+    }
+
+    /// A press of the binding already holding the recording is not a switch —
+    /// it must keep flowing to the normal stop/latch handling.
+    #[test]
+    fn same_binding_press_is_not_a_mode_switch() {
+        let mut stage = recording(BINDING, false);
+        assert!(!switch_transcribe_mode(&mut stage, BINDING));
+        assert_eq!(stage_post_process(&stage), Some(false));
+
+        let mut stage = Stage::Idle;
+        assert!(!switch_transcribe_mode(&mut stage, POST_PROCESS_BINDING));
     }
 
     // ---------------------------------------------------------------------
