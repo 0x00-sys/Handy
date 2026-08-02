@@ -349,6 +349,11 @@ pub struct AppSettings {
     pub bindings: HashMap<String, ShortcutBinding>,
     #[serde(default = "default_push_to_talk")]
     pub push_to_talk: bool,
+    /// Lets a push-to-talk hold be converted into a hands-free (latched)
+    /// recording, by double-tapping the shortcut or pressing the `hands_free`
+    /// key mid-hold. Off by default.
+    #[serde(default = "default_push_to_talk_hands_free")]
+    pub push_to_talk_hands_free: bool,
     #[serde(default)]
     pub audio_feedback: bool,
     #[serde(default = "default_audio_feedback_volume")]
@@ -483,6 +488,10 @@ fn default_settings_schema_version() -> u32 {
 
 fn default_push_to_talk() -> bool {
     true
+}
+
+fn default_push_to_talk_hands_free() -> bool {
+    false
 }
 
 fn default_always_on_microphone() -> bool {
@@ -841,10 +850,27 @@ pub fn get_default_settings() -> AppSettings {
         },
     );
 
+    // Registered only while a push-to-talk hold is in flight, composed with the
+    // modifiers the transcribe shortcut holds down (see
+    // `shortcut::compose_hands_free_hotkey`). "tab" because the stock
+    // transcribe shortcuts already claim space on every platform.
+    bindings.insert(
+        "hands_free".to_string(),
+        ShortcutBinding {
+            id: "hands_free".to_string(),
+            name: "Hands-Free".to_string(),
+            description: "Pressed during a push-to-talk hold, keeps recording after you let go."
+                .to_string(),
+            default_binding: "tab".to_string(),
+            current_binding: "tab".to_string(),
+        },
+    );
+
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
         bindings,
         push_to_talk: default_push_to_talk(),
+        push_to_talk_hands_free: default_push_to_talk_hands_free(),
         audio_feedback: false,
         audio_feedback_volume: default_audio_feedback_volume(),
         sound_theme: default_sound_theme(),

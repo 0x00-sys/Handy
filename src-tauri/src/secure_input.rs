@@ -509,6 +509,12 @@ mod imp {
         let mut immune = 0usize;
         if eligible {
             for (id, binding) in &settings.bindings {
+                // The hands-free key is registered composed with the modifiers
+                // the transcribe shortcut holds down, so its stored binding is
+                // not the hotkey to shadow — and it only matters mid-hold.
+                if id == "hands_free" {
+                    continue;
+                }
                 if id == "cancel" && !state.cancel_requested.load(Ordering::SeqCst) {
                     continue;
                 }

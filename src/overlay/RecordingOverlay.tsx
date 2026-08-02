@@ -10,6 +10,7 @@ import type {
   StreamWorkKind,
 } from "@/bindings";
 import i18n, { syncLanguageFromSettings } from "@/i18n";
+import { formatKeyCombination } from "@/lib/utils/keyboard";
 import { getLanguageDirection } from "@/lib/utils/rtl";
 
 type OverlayState = "recording" | "streaming" | "transcribing" | "processing";
@@ -39,6 +40,10 @@ const RecordingOverlay: React.FC = () => {
   // True once live text overflows the cap. A top overlay fades its top edge only
   // while overflowing, so the resting first line stays crisp flush under the pill.
   const [overflowing, setOverflowing] = useState(false);
+  // Push-to-talk hands-free: the key offered once a hold runs long, and whether
+  // the hold has since latched (the shortcut no longer has to be held).
+  const [handsFreeKey, setHandsFreeKey] = useState<string | null>(null);
+  const [handsFree, setHandsFree] = useState(false);
 
   const smoothedLevelsRef = useRef<number[]>(Array(16).fill(0));
   // Live-text scroll-back: the text region "sticks" to the newest line while the
@@ -68,6 +73,8 @@ const RecordingOverlay: React.FC = () => {
         setState(overlayState);
         if (overlayState === "recording" || overlayState === "streaming") {
           setStreamText({ committed: "", tentative: "" });
+          setHandsFreeKey(null);
+          setHandsFree(false);
         }
         if (overlayState === "streaming") {
           setPhase("listening");
@@ -104,12 +111,24 @@ const RecordingOverlay: React.FC = () => {
         if (payload.kind) setWorkKind(payload.kind);
       });
 
+      const unlistenHandsFreeHint = await listen<string>(
+        "hands-free-hint",
+        (event) => setHandsFreeKey(event.payload),
+      );
+
+      const unlistenHandsFreeActive = await listen("hands-free-active", () => {
+        setHandsFree(true);
+        setHandsFreeKey(null);
+      });
+
       return () => {
         unlistenShow();
         unlistenHide();
         unlistenLevel();
         unlistenStream();
         unlistenPhase();
+        unlistenHandsFreeHint();
+        unlistenHandsFreeActive();
       };
     };
 
@@ -180,12 +199,36 @@ const RecordingOverlay: React.FC = () => {
     </button>
   );
 
-  // dot (left) | waveform (center) | timer + cancel (right) — same structure for
-  // pill & panel, so the Live morph is a pure width change.
+  // Push-to-talk hands-free: offer the key while the hold is still running,
+  // then show the same label lit up once the hold has latched.
+  const handsFreeChip = handsFree ? (
+    <span className="shands-free">
+      <span className="sdot" />
+      <span className="shands-free-label">{t("overlay.handsFree")}</span>
+    </span>
+  ) : handsFreeKey ? (
+    <span className="shands-free-hint">
+      <kbd className="shands-free-key">
+        {formatKeyCombination(handsFreeKey, "unknown")}
+      </kbd>
+      <span className="shands-free-label">{t("overlay.handsFree")}</span>
+    </span>
+  ) : null;
+
+  // Which pill width the hands-free chip needs, if it is showing at all.
+  const handsFreeCard = handsFree
+    ? "chands-free"
+    : handsFreeKey
+      ? "chands-free-hint"
+      : "";
+
+  // status (left) | waveform (center) | timer + cancel (right) — same structure
+  // for pill & panel, so the Live morph is a pure width change. The hands-free
+  // chip, when present, replaces the dot in the status slot.
   const listeningRow = (showTimer: boolean, showCancel: boolean) => (
     <div className="sbase">
       <div className="sbase-l">
-        <span className="sdot" />
+        {handsFreeChip ?? <span className="sdot" />}
       </div>
       {waveform}
       <div className="sbase-r">
@@ -224,8 +267,8 @@ const RecordingOverlay: React.FC = () => {
         <div
           key={session}
           className={`scard ${open ? "open" : ""} ${collapsed ? "working" : ""} ${
-            isVisible ? "" : "leaving"
-          }`}
+            working ? "" : handsFreeCard
+          } ${isVisible ? "" : "leaving"}`}
         >
           <div className="stext">
             <div className="stext-clip">
@@ -274,7 +317,9 @@ const RecordingOverlay: React.FC = () => {
       className={`ov-stage ${position} ov-fade ${isVisible ? "show" : ""}`}
     >
       <div
-        className={`scard compact ${working && isVisible ? "cworking" : ""}`}
+        className={`scard compact ${working && isVisible ? "cworking" : ""} ${
+          working ? "" : handsFreeCard
+        }`}
       >
         {working ? workingRow(workLabel, true) : listeningRow(false, true)}
       </div>

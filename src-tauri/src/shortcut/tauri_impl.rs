@@ -20,8 +20,8 @@ pub fn init_shortcuts(app: &AppHandle) {
 
     // Register all default shortcuts, applying user customizations
     for (id, default_binding) in default_bindings {
-        if id == "cancel" {
-            continue; // Skip cancel shortcut, it will be registered dynamically
+        if super::is_dynamic_binding(&id) {
+            continue; // Registered dynamically by the recording lifecycle
         }
         // Skip post-processing shortcut when the feature is disabled
         if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
@@ -46,10 +46,7 @@ pub fn validate_shortcut(raw: &str) -> Result<(), String> {
         return Err("Shortcut cannot be empty".into());
     }
 
-    let modifiers = [
-        "ctrl", "control", "shift", "alt", "option", "meta", "command", "cmd", "super", "win",
-        "windows",
-    ];
+    let modifiers = super::MODIFIER_KEYS;
 
     // Check for fn key which Tauri doesn't support
     let parts: Vec<String> = raw.split('+').map(|p| p.trim().to_lowercase()).collect();

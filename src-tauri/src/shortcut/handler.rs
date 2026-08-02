@@ -18,6 +18,7 @@ use crate::TranscriptionCoordinator;
 /// This function contains the shared logic for:
 /// - Looking up the action in ACTION_MAP
 /// - Handling the cancel binding (only fires when recording)
+/// - Handling the hands-free binding (latches an in-flight push-to-talk hold)
 /// - Handling push-to-talk mode (start on press, stop on release)
 /// - Handling toggle mode (toggle state on press only)
 ///
@@ -37,9 +38,28 @@ pub fn handle_shortcut_event(
     // Transcribe bindings are handled by the coordinator.
     if is_transcribe_binding(binding_id) {
         if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-            coordinator.send_input(binding_id, hotkey_string, is_pressed, settings.push_to_talk);
+            coordinator.send_input(
+                binding_id,
+                hotkey_string,
+                is_pressed,
+                settings.push_to_talk,
+                settings.push_to_talk_hands_free,
+            );
         } else {
             warn!("TranscriptionCoordinator is not initialized");
+        }
+        return;
+    }
+
+    // Hands-free binding: only registered during a push-to-talk hold, and only
+    // the press matters — the coordinator ignores it unless a hold is in flight.
+    if binding_id == "hands_free" {
+        if is_pressed {
+            if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
+                coordinator.notify_hands_free_latch();
+            } else {
+                warn!("TranscriptionCoordinator is not initialized");
+            }
         }
         return;
     }

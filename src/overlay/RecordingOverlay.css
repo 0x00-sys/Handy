@@ -30,6 +30,10 @@
   --ov-pill-w: 184px; /* base width / Live pill before it opens or collapses */
   --ov-work-w: 216px; /* working pill (transcribing / polishing) -- wide enough to
                          center longer labels; shared by Live (collapsed) + minimal */
+  --ov-hands-free-w: 214px; /* pill carrying the latched hands-free chip */
+  --ov-hands-free-hint-w: 246px; /* same pill while it also carries the keycap --
+                                    the widest compact form, kept under
+                                    OVERLAY_WIDTH (256px) so it is never clipped */
   --ov-open-w: 392px; /* Live panel, expanded */
   --ov-base-h: 40px; /* control-row height (.sbase) */
   --ov-cap-max-h: 64px; /* max height of the scrolling live-text region */
@@ -172,6 +176,14 @@
 }
 .scard.compact.cworking {
   width: var(--ov-work-w);
+}
+/* Applies to the Live pill too, not just the compact one: before it opens the
+   Live card is narrower still (--ov-pill-w), and it carries the same chip. */
+.scard.chands-free:not(.open) {
+  width: var(--ov-hands-free-w);
+}
+.scard.chands-free-hint:not(.open) {
+  width: var(--ov-hands-free-hint-w);
 }
 
 /* text region — auto-height open via grid-rows trick; region fades as a whole */
@@ -340,6 +352,68 @@
 }
 .sx:active {
   transform: scale(0.95);
+}
+
+/* push-to-talk hands-free — the offered key, then the latched state. Both take
+   the status slot on the left, keeping the row's three zones intact. The latched
+   chip wraps the same `.sdot` rather than replacing it: hands-free is the one
+   state where the user may fall silent for a while, and the dot then remains
+   proof that something is still being captured. */
+.shands-free-hint,
+.shands-free {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1;
+  border-radius: 9px;
+  padding: 4px 8px;
+}
+.shands-free-hint {
+  color: var(--s-muted);
+  background: var(--s-hair);
+}
+.shands-free {
+  color: var(--s-accent);
+  background: var(--s-accent-soft);
+  font-weight: 500;
+}
+/* The offered key, drawn as a keycap so it reads as something to press. */
+.shands-free-key {
+  flex: none;
+  font: inherit;
+  font-size: 10px;
+  padding: 2px 5px;
+  border-radius: 5px;
+  color: var(--color-text);
+  background: var(--s-surface);
+  border: 1px solid var(--s-border);
+}
+.shands-free-label {
+  /* Safety net past the pill width, same as .swork-label: a long translation
+     ellipsizes rather than pushing the waveform off-centre. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The chip is far wider than the bare dot the slot normally holds, and it would
+   overflow its 1fr track onto the waveform. Size the side zones to their
+   content instead and let the waveform centre itself in what is left. */
+.scard.chands-free .sbase,
+.scard.chands-free-hint .sbase {
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto;
+}
+.scard.chands-free .sbase-l,
+.scard.chands-free-hint .sbase-l {
+  min-width: 0;
+  padding-left: 0; /* the chip's own padding is the inset now */
+}
+.scard.chands-free .swave,
+.scard.chands-free-hint .swave {
+  justify-content: center;
+  padding-right: 0; /* would bias the centring */
 }
 
 /* working state (transcribing / polishing) — spinner + label */

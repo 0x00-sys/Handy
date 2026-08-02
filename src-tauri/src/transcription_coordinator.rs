@@ -10,17 +10,79 @@ use tauri::{AppHandle, Manager};
 const DEBOUNCE: Duration = Duration::from_millis(30);
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
 
+/// The longest hold still counted as a "tap" when looking for a double-tap.
+/// A real push-to-talk hold runs longer than this, so ordinary dictation never
+/// pays the `DOUBLE_TAP_WINDOW` wait below.
+const TAP_MAX_HOLD: Duration = Duration::from_millis(250);
+
+/// How long a tap's stop is deferred while we wait to see whether a second tap
+/// arrives to latch hands-free.
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(300);
+
+/// A re-press sooner than this after a release is key chatter or X11
+/// auto-repeat, never a human double-tap.
+const DOUBLE_TAP_MIN_GAP: Duration = Duration::from_millis(40);
+
+/// How long the shortcut must be held before the overlay offers the hands-free
+/// key: long enough that ordinary dictation never sees the hint.
+const HANDS_FREE_HINT_DELAY: Duration = Duration::from_millis(5000);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PttAction {
     Passthrough,
-    DeferRelease,
+    /// Hold the stop back briefly. `is_tap` marks a release short enough to be
+    /// the first half of a double-tap, which earns the longer window.
+    DeferRelease {
+        is_tap: bool,
+    },
     CancelRelease,
+    /// Second tap of a double-tap: keep recording, hands-free.
+    Latch,
 }
 
 struct PendingRelease {
     binding_id: String,
     hotkey_string: String,
     deadline: Instant,
+    /// Set when the release ended a tap rather than a hold, so a re-press
+    /// inside the window latches instead of merely cancelling the stop.
+    is_tap: bool,
+    released_at: Instant,
+}
+
+/// How long a deferred release is held back before its stop fires.
+fn defer_window(is_tap: bool) -> Duration {
+    if is_tap {
+        DOUBLE_TAP_WINDOW
+    } else {
+        RELEASE_GRACE
+    }
+}
+
+/// The subset of `PendingRelease` that classification needs.
+#[derive(Debug, Clone, Copy)]
+struct PendingReleaseView<'a> {
+    binding_id: &'a str,
+    is_tap: bool,
+    /// Time since the release was deferred.
+    since_release: Duration,
+}
+
+/// Everything `classify_ptt_event` reads, gathered so the state machine stays
+/// a pure function of its inputs and can be unit-tested without a running app.
+#[derive(Debug, Clone, Copy)]
+struct PttInput<'a> {
+    pending_release: Option<PendingReleaseView<'a>>,
+    is_pressed: bool,
+    push_to_talk: bool,
+    /// The `push_to_talk_hands_free` setting.
+    hands_free: bool,
+    binding_id: &'a str,
+    /// `(binding currently recording, whether it is already latched)`.
+    recording: Option<(&'a str, bool)>,
+    /// How long the key has been down, measured at this event. Auto-repeat
+    /// presses do not restart it — it measures the whole hold.
+    hold_elapsed: Duration,
 }
 
 /// Commands processed sequentially by the coordinator thread.
@@ -30,7 +92,10 @@ enum Command {
         hotkey_string: String,
         is_pressed: bool,
         push_to_talk: bool,
+        hands_free: bool,
     },
+    /// The dedicated hands-free key fired during a push-to-talk hold.
+    HandsFreeLatch,
     Cancel {
         recording_was_active: bool,
     },
@@ -40,31 +105,106 @@ enum Command {
 /// Pipeline lifecycle, owned exclusively by the coordinator thread.
 enum Stage {
     Idle,
-    Recording(String), // binding_id
+    Recording {
+        binding_id: String,
+        /// Hands-free: the shortcut is no longer holding the recording open,
+        /// so releases are ignored and the next press stops it.
+        latched: bool,
+    },
     Processing,
 }
 
-fn classify_ptt_event(
-    pending_release_binding: Option<&str>,
-    is_pressed: bool,
-    push_to_talk: bool,
-    binding_id: &str,
-    recording_binding: Option<&str>,
-) -> PttAction {
-    if !push_to_talk {
+impl Stage {
+    fn recording(&self) -> Option<(&str, bool)> {
+        match self {
+            Stage::Recording {
+                binding_id,
+                latched,
+            } => Some((binding_id.as_str(), *latched)),
+            _ => None,
+        }
+    }
+}
+
+fn classify_ptt_event(input: PttInput) -> PttAction {
+    if !input.push_to_talk {
         return PttAction::Passthrough;
     }
 
-    if is_pressed {
-        if pending_release_binding == Some(binding_id) {
-            PttAction::CancelRelease
-        } else {
-            PttAction::Passthrough
+    if input.is_pressed {
+        match input.pending_release {
+            // The key came back down before the deferred stop fired. A tap
+            // re-pressed inside the double-tap window is the user asking for
+            // hands-free; anything else is auto-repeat holding the key open.
+            // The window is bounded here rather than by the timer alone: a busy
+            // coordinator can dequeue a press after its deadline, and a late
+            // press must never latch (and drop) the stop it was racing.
+            Some(pending) if pending.binding_id == input.binding_id => {
+                let is_second_tap = input.hands_free
+                    && pending.is_tap
+                    && (DOUBLE_TAP_MIN_GAP..DOUBLE_TAP_WINDOW).contains(&pending.since_release)
+                    // Without an unlatched recording there is nothing to latch,
+                    // and latching would silently discard the deferred stop.
+                    && input
+                        .recording
+                        .is_some_and(|(id, latched)| id == input.binding_id && !latched);
+                if is_second_tap {
+                    PttAction::Latch
+                } else {
+                    PttAction::CancelRelease
+                }
+            }
+            _ => PttAction::Passthrough,
         }
-    } else if recording_binding == Some(binding_id) && pending_release_binding.is_none() {
-        PttAction::DeferRelease
     } else {
-        PttAction::Passthrough
+        match input.recording {
+            // Every release is deferred, latched or not. Unlatched, the delay
+            // absorbs auto-repeat before the stop fires; latched, nothing fires
+            // on expiry, but the deferral still lets an auto-repeat press be
+            // recognised and swallowed instead of ending the recording.
+            Some((id, latched)) if id == input.binding_id && input.pending_release.is_none() => {
+                PttAction::DeferRelease {
+                    is_tap: input.hands_free && !latched && input.hold_elapsed <= TAP_MAX_HOLD,
+                }
+            }
+            _ => PttAction::Passthrough,
+        }
+    }
+}
+
+/// Fire a deferred release whose window has closed. Called from the timer arm,
+/// and again before any input is handled: a coordinator that was busy past a
+/// deadline dequeues the next event with `Ok` rather than `Timeout`, and it must
+/// still behave exactly like one that woke on time.
+fn expire_pending_release(
+    app: &AppHandle,
+    stage: &mut Stage,
+    pending_release: &mut Option<PendingRelease>,
+    hint_deadline: &mut Option<Instant>,
+    hold_started: &mut Option<Instant>,
+    now: Instant,
+) {
+    let Some(pending) = pending_release.take_if(|pending| pending.deadline <= now) else {
+        return;
+    };
+    // A latched recording has no stop to fire here: the deferral existed only
+    // to absorb auto-repeat.
+    if stops_recording(stage, &pending.binding_id, false) {
+        *hint_deadline = None;
+        *hold_started = None;
+        stop(app, stage, &pending.binding_id, &pending.hotkey_string);
+    }
+}
+
+/// Whether this event ends the recording: a latched one waits for the next
+/// press, an ordinary hold ends when the key it started with comes back up.
+fn stops_recording(stage: &Stage, binding_id: &str, is_pressed: bool) -> bool {
+    match stage {
+        Stage::Recording {
+            binding_id: id,
+            latched,
+        } => id == binding_id && *latched == is_pressed,
+        _ => false,
     }
 }
 
@@ -88,25 +228,45 @@ impl TranscriptionCoordinator {
                 let mut stage = Stage::Idle;
                 let mut last_press: Option<Instant> = None;
                 let mut pending_release: Option<PendingRelease> = None;
+                // Start of the current hold. Auto-repeat presses never reset it,
+                // so it measures how long the key has actually been down.
+                let mut hold_started: Option<Instant> = None;
+                // When to offer the hands-free key in the overlay.
+                let mut hint_deadline: Option<Instant> = None;
 
                 loop {
-                    let cmd = if let Some(pending) = &pending_release {
-                        match rx.recv_timeout(
-                            pending.deadline.saturating_duration_since(Instant::now()),
-                        ) {
+                    let next_deadline = [
+                        pending_release.as_ref().map(|pending| pending.deadline),
+                        hint_deadline,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min();
+
+                    let cmd = if let Some(deadline) = next_deadline {
+                        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                             Ok(cmd) => cmd,
                             Err(mpsc::RecvTimeoutError::Timeout) => {
-                                if let Some(pending) = pending_release.take() {
-                                    if matches!(&stage, Stage::Recording(id) if id == &pending.binding_id)
-                                    {
-                                        stop(
-                                            &app,
-                                            &mut stage,
-                                            &pending.binding_id,
-                                            &pending.hotkey_string,
-                                        );
+                                let now = Instant::now();
+
+                                if hint_deadline.is_some_and(|at| at <= now) {
+                                    hint_deadline = None;
+                                    if matches!(stage.recording(), Some((_, false))) {
+                                        if let Some(key) = crate::shortcut::active_hands_free_key()
+                                        {
+                                            crate::overlay::emit_hands_free_hint(&app, &key);
+                                        }
                                     }
                                 }
+
+                                expire_pending_release(
+                                    &app,
+                                    &mut stage,
+                                    &mut pending_release,
+                                    &mut hint_deadline,
+                                    &mut hold_started,
+                                    now,
+                                );
                                 continue;
                             }
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -124,31 +284,57 @@ impl TranscriptionCoordinator {
                             hotkey_string,
                             is_pressed,
                             push_to_talk,
+                            hands_free,
                         } => {
-                            let pending_release_binding = pending_release
-                                .as_ref()
-                                .map(|pending| pending.binding_id.as_str());
-                            let recording_binding = match &stage {
-                                Stage::Recording(id) => Some(id.as_str()),
-                                _ => None,
-                            };
+                            let now = Instant::now();
+                            // Settle any deadline this event overtook, so a late
+                            // press is classified against the same state it would
+                            // have met had the timer fired first.
+                            expire_pending_release(
+                                &app,
+                                &mut stage,
+                                &mut pending_release,
+                                &mut hint_deadline,
+                                &mut hold_started,
+                                now,
+                            );
 
-                            match classify_ptt_event(
-                                pending_release_binding,
+                            let action = classify_ptt_event(PttInput {
+                                pending_release: pending_release.as_ref().map(|pending| {
+                                    PendingReleaseView {
+                                        binding_id: pending.binding_id.as_str(),
+                                        is_tap: pending.is_tap,
+                                        since_release: now.duration_since(pending.released_at),
+                                    }
+                                }),
                                 is_pressed,
                                 push_to_talk,
-                                &binding_id,
-                                recording_binding,
-                            ) {
+                                hands_free,
+                                binding_id: &binding_id,
+                                recording: stage.recording(),
+                                hold_elapsed: hold_started
+                                    .map(|at| now.duration_since(at))
+                                    .unwrap_or(Duration::MAX),
+                            });
+
+                            match action {
+                                PttAction::Latch => {
+                                    if latch(&app, &mut stage) {
+                                        pending_release = None;
+                                    }
+                                    continue;
+                                }
                                 PttAction::CancelRelease => {
                                     pending_release = None;
                                     continue;
                                 }
-                                PttAction::DeferRelease => {
+                                PttAction::DeferRelease { is_tap } => {
                                     pending_release = Some(PendingRelease {
                                         binding_id,
                                         hotkey_string,
-                                        deadline: Instant::now() + RELEASE_GRACE,
+                                        deadline: now + defer_window(is_tap),
+                                        is_tap,
+                                        released_at: now,
                                     });
                                     continue;
                                 }
@@ -158,20 +344,34 @@ impl TranscriptionCoordinator {
                             // Debounce rapid-fire press events (key repeat / double-tap).
                             // Push-to-talk releases may be deferred above to absorb X11 auto-repeat.
                             if is_pressed {
-                                let now = Instant::now();
                                 if last_press.is_some_and(|t| now.duration_since(t) < DEBOUNCE) {
                                     debug!("Debounced press for '{binding_id}'");
                                     continue;
                                 }
                                 last_press = Some(now);
+                                hold_started = Some(now);
                             }
 
                             if push_to_talk {
                                 if is_pressed && matches!(stage, Stage::Idle) {
                                     start(&app, &mut stage, &binding_id, &hotkey_string);
-                                } else if !is_pressed
-                                    && matches!(&stage, Stage::Recording(id) if id == &binding_id)
-                                {
+                                    // The hands-free key is claimed here rather
+                                    // than in `TranscribeAction::start`, which
+                                    // cannot tell a genuine hold from a
+                                    // CLI/signal toggle reusing the same path.
+                                    hint_deadline =
+                                        if hands_free && matches!(stage, Stage::Recording { .. }) {
+                                            crate::shortcut::register_hands_free_shortcut(
+                                                &app,
+                                                &binding_id,
+                                            );
+                                            Some(now + HANDS_FREE_HINT_DELAY)
+                                        } else {
+                                            None
+                                        };
+                                } else if stops_recording(&stage, &binding_id, is_pressed) {
+                                    hint_deadline = None;
+                                    hold_started = None;
                                     stop(&app, &mut stage, &binding_id, &hotkey_string);
                                 }
                             } else if is_pressed {
@@ -179,7 +379,11 @@ impl TranscriptionCoordinator {
                                     Stage::Idle => {
                                         start(&app, &mut stage, &binding_id, &hotkey_string);
                                     }
-                                    Stage::Recording(id) if id == &binding_id => {
+                                    Stage::Recording { binding_id: id, .. }
+                                        if id == &binding_id =>
+                                    {
+                                        hint_deadline = None;
+                                        hold_started = None;
                                         stop(&app, &mut stage, &binding_id, &hotkey_string);
                                     }
                                     _ => {
@@ -188,13 +392,23 @@ impl TranscriptionCoordinator {
                                 }
                             }
                         }
+                        Command::HandsFreeLatch => {
+                            // Only drop the deferred stop if there was actually a
+                            // recording to latch; otherwise it still has to fire.
+                            if latch(&app, &mut stage) {
+                                pending_release = None;
+                            }
+                        }
                         Command::Cancel {
                             recording_was_active,
                         } => {
                             pending_release = None;
+                            hint_deadline = None;
+                            hold_started = None;
                             // Don't reset during processing — wait for the pipeline to finish.
                             if !matches!(stage, Stage::Processing)
-                                && (recording_was_active || matches!(stage, Stage::Recording(_)))
+                                && (recording_was_active
+                                    || matches!(stage, Stage::Recording { .. }))
                             {
                                 stage = Stage::Idle;
                             }
@@ -215,13 +429,15 @@ impl TranscriptionCoordinator {
     }
 
     /// Send a keyboard/signal input event for a transcribe binding.
-    /// For signal-based toggles, use `is_pressed: true` and `push_to_talk: false`.
+    /// For signal-based toggles, use `is_pressed: true` and `push_to_talk: false`
+    /// (which also makes `hands_free` irrelevant — there is no hold to latch).
     pub fn send_input(
         &self,
         binding_id: &str,
         hotkey_string: &str,
         is_pressed: bool,
         push_to_talk: bool,
+        hands_free: bool,
     ) {
         if self
             .tx
@@ -230,9 +446,17 @@ impl TranscriptionCoordinator {
                 hotkey_string: hotkey_string.to_string(),
                 is_pressed,
                 push_to_talk,
+                hands_free,
             })
             .is_err()
         {
+            warn!("Transcription coordinator channel closed");
+        }
+    }
+
+    /// Convert an in-flight push-to-talk hold into a hands-free recording.
+    pub fn notify_hands_free_latch(&self) {
+        if self.tx.send(Command::HandsFreeLatch).is_err() {
             warn!("Transcription coordinator channel closed");
         }
     }
@@ -266,7 +490,10 @@ fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &s
         .try_state::<Arc<AudioRecordingManager>>()
         .is_some_and(|a| a.is_recording())
     {
-        *stage = Stage::Recording(binding_id.to_string());
+        *stage = Stage::Recording {
+            binding_id: binding_id.to_string(),
+            latched: false,
+        };
     } else {
         debug!("Start for '{binding_id}' did not begin recording; staying idle");
     }
@@ -281,28 +508,71 @@ fn stop(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &st
     *stage = Stage::Processing;
 }
 
+/// Switch the in-flight hold to hands-free: the shortcut stops holding the
+/// recording open and the next press ends it. The hands-free key is released
+/// back to the foreground app now that it has done its job.
+///
+/// Returns whether anything latched — `false` when there was no unlatched
+/// recording, so callers know the deferred stop still has to fire.
+fn latch(app: &AppHandle, stage: &mut Stage) -> bool {
+    let Stage::Recording { latched, .. } = stage else {
+        return false;
+    };
+    if *latched {
+        return false;
+    }
+    *latched = true;
+    debug!("Push-to-talk hold latched into hands-free recording");
+    crate::shortcut::unregister_hands_free_shortcut(app);
+    crate::overlay::emit_hands_free_active(app);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Baseline input: push-to-talk on, hands-free off, nothing pending.
+    fn input(is_pressed: bool) -> PttInput<'static> {
+        PttInput {
+            pending_release: None,
+            is_pressed,
+            push_to_talk: true,
+            hands_free: false,
+            binding_id: BINDING,
+            recording: None,
+            hold_elapsed: Duration::MAX,
+        }
+    }
+
+    /// A deferred release, re-pressed after a human-length gap.
+    fn pending(is_tap: bool) -> PendingReleaseView<'static> {
+        PendingReleaseView {
+            binding_id: BINDING,
+            is_tap,
+            since_release: Duration::from_millis(120),
+        }
+    }
+
     #[test]
     fn push_to_talk_release_while_recording_defers_release() {
         assert_eq!(
-            classify_ptt_event(None, false, true, "transcribe", Some("transcribe")),
-            PttAction::DeferRelease
+            classify_ptt_event(PttInput {
+                recording: Some((BINDING, false)),
+                ..input(false)
+            }),
+            PttAction::DeferRelease { is_tap: false }
         );
     }
 
     #[test]
     fn push_to_talk_press_matching_pending_release_cancels_release() {
         assert_eq!(
-            classify_ptt_event(
-                Some("transcribe"),
-                true,
-                true,
-                "transcribe",
-                Some("transcribe")
-            ),
+            classify_ptt_event(PttInput {
+                pending_release: Some(pending(false)),
+                recording: Some((BINDING, false)),
+                ..input(true)
+            }),
             PttAction::CancelRelease
         );
     }
@@ -310,17 +580,20 @@ mod tests {
     #[test]
     fn toggle_mode_press_and_release_pass_through() {
         assert_eq!(
-            classify_ptt_event(
-                Some("transcribe"),
-                true,
-                false,
-                "transcribe",
-                Some("transcribe")
-            ),
+            classify_ptt_event(PttInput {
+                pending_release: Some(pending(false)),
+                push_to_talk: false,
+                recording: Some((BINDING, false)),
+                ..input(true)
+            }),
             PttAction::Passthrough
         );
         assert_eq!(
-            classify_ptt_event(None, false, false, "transcribe", Some("transcribe")),
+            classify_ptt_event(PttInput {
+                push_to_talk: false,
+                recording: Some((BINDING, false)),
+                ..input(false)
+            }),
             PttAction::Passthrough
         );
     }
@@ -328,13 +601,12 @@ mod tests {
     #[test]
     fn press_for_different_binding_than_pending_release_passes_through() {
         assert_eq!(
-            classify_ptt_event(
-                Some("transcribe"),
-                true,
-                true,
-                "transcribe_with_post_process",
-                Some("transcribe")
-            ),
+            classify_ptt_event(PttInput {
+                pending_release: Some(pending(false)),
+                binding_id: "transcribe_with_post_process",
+                recording: Some((BINDING, false)),
+                ..input(true)
+            }),
             PttAction::Passthrough
         );
     }
@@ -342,8 +614,170 @@ mod tests {
     #[test]
     fn press_matching_pending_release_cancels_without_recording_state() {
         assert_eq!(
-            classify_ptt_event(Some("transcribe"), true, true, "transcribe", None),
+            classify_ptt_event(PttInput {
+                pending_release: Some(pending(false)),
+                ..input(true)
+            }),
             PttAction::CancelRelease
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Hands-free latching
+    // ---------------------------------------------------------------------
+
+    /// A short hold released with hands-free enabled is a double-tap candidate,
+    /// so its stop earns the longer window instead of the auto-repeat grace.
+    #[test]
+    fn short_hold_release_is_a_tap_when_hands_free_is_enabled() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                hands_free: true,
+                recording: Some((BINDING, false)),
+                hold_elapsed: Duration::from_millis(120),
+                ..input(false)
+            }),
+            PttAction::DeferRelease { is_tap: true }
+        );
+    }
+
+    /// The latency guarantee for ordinary dictation: a hold long enough to say
+    /// anything is never a tap, so its release keeps the 50 ms grace and stops
+    /// as promptly as it always did.
+    #[test]
+    fn long_hold_release_is_not_a_tap() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                hands_free: true,
+                recording: Some((BINDING, false)),
+                hold_elapsed: TAP_MAX_HOLD + Duration::from_millis(1),
+                ..input(false)
+            }),
+            PttAction::DeferRelease { is_tap: false }
+        );
+    }
+
+    /// With the setting off, a short hold behaves exactly as before.
+    #[test]
+    fn short_hold_is_not_a_tap_when_hands_free_is_disabled() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                recording: Some((BINDING, false)),
+                hold_elapsed: Duration::from_millis(120),
+                ..input(false)
+            }),
+            PttAction::DeferRelease { is_tap: false }
+        );
+    }
+
+    #[test]
+    fn second_tap_inside_the_window_latches() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                pending_release: Some(pending(true)),
+                hands_free: true,
+                recording: Some((BINDING, false)),
+                ..input(true)
+            }),
+            PttAction::Latch
+        );
+    }
+
+    /// Key chatter and X11 auto-repeat re-press almost instantly; only a human
+    /// gap counts as a deliberate second tap.
+    #[test]
+    fn re_press_inside_the_minimum_gap_does_not_latch() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                pending_release: Some(PendingReleaseView {
+                    since_release: DOUBLE_TAP_MIN_GAP - Duration::from_millis(1),
+                    ..pending(true)
+                }),
+                hands_free: true,
+                recording: Some((BINDING, false)),
+                ..input(true)
+            }),
+            PttAction::CancelRelease
+        );
+    }
+
+    /// The double-tap window is bounded on both sides by the classifier, not
+    /// just by the timer: a busy coordinator thread can dequeue a press after
+    /// its deadline, and a late press must not latch — it would also discard the
+    /// stop it was racing.
+    #[test]
+    fn re_press_after_the_window_closed_does_not_latch() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                pending_release: Some(PendingReleaseView {
+                    since_release: DOUBLE_TAP_WINDOW,
+                    ..pending(true)
+                }),
+                hands_free: true,
+                recording: Some((BINDING, false)),
+                ..input(true)
+            }),
+            PttAction::CancelRelease
+        );
+    }
+
+    /// Latching needs a recording to latch. Without one the deferred stop is
+    /// merely cancelled — never silently dropped by a latch that no-ops.
+    #[test]
+    fn second_tap_without_a_recording_does_not_latch() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                pending_release: Some(pending(true)),
+                hands_free: true,
+                ..input(true)
+            }),
+            PttAction::CancelRelease
+        );
+    }
+
+    /// Latching requires the deferred release to have been a tap; re-pressing
+    /// after a long hold just keeps the existing recording open.
+    #[test]
+    fn re_press_after_a_long_hold_does_not_latch() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                pending_release: Some(pending(false)),
+                hands_free: true,
+                recording: Some((BINDING, false)),
+                ..input(true)
+            }),
+            PttAction::CancelRelease
+        );
+    }
+
+    /// Once latched the key no longer holds the recording open, so letting go
+    /// must not stop it — including the release of the second tap itself. The
+    /// release is still deferred (nothing fires on expiry) so that an
+    /// auto-repeat press behind it is recognised rather than read as a stop.
+    #[test]
+    fn release_while_latched_defers_without_arming_a_tap() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                hands_free: true,
+                recording: Some((BINDING, true)),
+                hold_elapsed: Duration::from_millis(80),
+                ..input(false)
+            }),
+            PttAction::DeferRelease { is_tap: false }
+        );
+    }
+
+    /// A press while latched is the user ending the hands-free recording; it
+    /// passes through to the stop branch rather than being swallowed.
+    #[test]
+    fn press_while_latched_passes_through_to_stop() {
+        assert_eq!(
+            classify_ptt_event(PttInput {
+                hands_free: true,
+                recording: Some((BINDING, true)),
+                ..input(true)
+            }),
+            PttAction::Passthrough
         );
     }
 
@@ -374,14 +808,16 @@ mod tests {
         Press,
         /// A key-up event (synthesized auto-repeat release or the genuine key-up).
         Release,
-        /// The `RELEASE_GRACE` window elapsed with no cancelling press arriving.
+        /// The deferred-release window elapsed with no cancelling press arriving.
         Grace,
+        /// Time passing with no key activity, in milliseconds.
+        Wait(u64),
     }
 
     #[derive(Debug, PartialEq, Eq)]
     enum SimStage {
         Idle,
-        Recording,
+        Recording { latched: bool },
         Processing,
     }
 
@@ -393,11 +829,12 @@ mod tests {
 
     /// Mirror of the coordinator loop's decision logic for a single push-to-talk
     /// binding: it calls the real `classify_ptt_event` and applies the exact same
-    /// Defer / Cancel / debounce / start / stop transitions.
-    fn simulate(events: &[Ev]) -> SimResult {
+    /// Defer / Cancel / Latch / debounce / start / stop transitions.
+    fn simulate(events: &[Ev], hands_free: bool) -> SimResult {
         let mut stage = SimStage::Idle;
-        let mut pending: Option<String> = None;
+        let mut pending: Option<(bool, u64)> = None; // (is_tap, released_at_ms)
         let mut last_press_ms: Option<u64> = None;
+        let mut hold_started_ms: Option<u64> = None;
         let mut clock_ms: u64 = 0;
         let mut starts = 0u32;
         let mut stops = 0u32;
@@ -405,41 +842,66 @@ mod tests {
 
         for ev in events {
             // Auto-repeat events arrive a few ms apart, well inside DEBOUNCE.
-            clock_ms += 5;
+            clock_ms += match ev {
+                Ev::Wait(ms) => *ms,
+                // Long enough to close either deferral window.
+                Ev::Grace => DOUBLE_TAP_WINDOW.as_millis() as u64 + 1,
+                _ => 5,
+            };
 
-            match ev {
-                Ev::Grace => {
-                    // Coordinator's `RecvTimeoutError::Timeout` arm: fire the
-                    // deferred release iff we are still recording that binding.
-                    if let Some(pending_binding) = pending.take() {
-                        if stage == SimStage::Recording && pending_binding == BINDING {
-                            stage = SimStage::Processing;
-                            stops += 1;
-                        }
+            // Coordinator's `RecvTimeoutError::Timeout` arm: once a deferred
+            // release's window elapses it fires, stopping the recording only if
+            // the binding is still holding it open.
+            if let Some((is_tap, released_at)) = pending {
+                if clock_ms - released_at >= defer_window(is_tap).as_millis() as u64 {
+                    pending = None;
+                    if stage == (SimStage::Recording { latched: false }) {
+                        stage = SimStage::Processing;
+                        hold_started_ms = None;
+                        stops += 1;
                     }
                 }
+            }
+
+            match ev {
+                Ev::Wait(_) | Ev::Grace => {}
                 Ev::Press | Ev::Release => {
                     let is_pressed = matches!(ev, Ev::Press);
-                    let pending_binding = pending.as_deref();
-                    let recording_binding = if stage == SimStage::Recording {
-                        Some(BINDING)
-                    } else {
-                        None
+                    let recording = match &stage {
+                        SimStage::Recording { latched } => Some((BINDING, *latched)),
+                        _ => None,
                     };
 
-                    match classify_ptt_event(
-                        pending_binding,
+                    let action = classify_ptt_event(PttInput {
+                        pending_release: pending.map(|(is_tap, at)| PendingReleaseView {
+                            binding_id: BINDING,
+                            is_tap,
+                            since_release: Duration::from_millis(clock_ms - at),
+                        }),
                         is_pressed,
-                        true, // push_to_talk
-                        BINDING,
-                        recording_binding,
-                    ) {
+                        push_to_talk: true,
+                        hands_free,
+                        binding_id: BINDING,
+                        recording,
+                        hold_elapsed: hold_started_ms
+                            .map(|at| Duration::from_millis(clock_ms - at))
+                            .unwrap_or(Duration::MAX),
+                    });
+
+                    match action {
+                        PttAction::Latch => {
+                            pending = None;
+                            if let SimStage::Recording { latched } = &mut stage {
+                                *latched = true;
+                            }
+                            continue;
+                        }
                         PttAction::CancelRelease => {
                             pending = None;
                             continue;
                         }
-                        PttAction::DeferRelease => {
-                            pending = Some(BINDING.to_string());
+                        PttAction::DeferRelease { is_tap } => {
+                            pending = Some((is_tap, clock_ms));
                             continue;
                         }
                         PttAction::Passthrough => {}
@@ -450,14 +912,21 @@ mod tests {
                             continue;
                         }
                         last_press_ms = Some(clock_ms);
+                        hold_started_ms = Some(clock_ms);
                     }
 
-                    if is_pressed && stage == SimStage::Idle {
-                        stage = SimStage::Recording;
-                        starts += 1;
-                    } else if !is_pressed && stage == SimStage::Recording {
-                        stage = SimStage::Processing;
-                        stops += 1;
+                    match (&stage, is_pressed) {
+                        (SimStage::Idle, true) => {
+                            stage = SimStage::Recording { latched: false };
+                            starts += 1;
+                        }
+                        (SimStage::Recording { latched: true }, true)
+                        | (SimStage::Recording { latched: false }, false) => {
+                            stage = SimStage::Processing;
+                            hold_started_ms = None;
+                            stops += 1;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -471,12 +940,15 @@ mod tests {
     }
 
     /// Initial press plus several synthesized release/press pairs, as X11 emits
-    /// while a push-to-talk key is held down.
+    /// while a push-to-talk key is held down. The first auto-repeat only arrives
+    /// after the system's repeat delay, so the hold is already well past
+    /// `TAP_MAX_HOLD` by then.
     fn autorepeat_burst() -> Vec<Ev> {
-        let mut events = vec![Ev::Press];
+        let mut events = vec![Ev::Press, Ev::Wait(660)];
         for _ in 0..6 {
             events.push(Ev::Release);
             events.push(Ev::Press);
+            events.push(Ev::Wait(40));
         }
         events
     }
@@ -488,7 +960,7 @@ mod tests {
     /// recording stays continuously active for the whole burst.
     #[test]
     fn x11_autorepeat_burst_does_not_toggle_recording() {
-        let result = simulate(&autorepeat_burst());
+        let result = simulate(&autorepeat_burst(), false);
         assert_eq!(result.starts, 1, "recording should start exactly once");
         assert_eq!(
             result.stops, 0,
@@ -496,8 +968,23 @@ mod tests {
         );
         assert_eq!(
             result.stage,
-            SimStage::Recording,
+            SimStage::Recording { latched: false },
             "recording must remain active across the entire auto-repeat burst"
+        );
+    }
+
+    /// The same burst with hands-free enabled must still not latch: auto-repeat
+    /// re-presses arrive far inside `DOUBLE_TAP_MIN_GAP`, and the hold they
+    /// interrupt is long past `TAP_MAX_HOLD`.
+    #[test]
+    fn x11_autorepeat_burst_does_not_latch_hands_free() {
+        let result = simulate(&autorepeat_burst(), true);
+        assert_eq!(result.starts, 1);
+        assert_eq!(result.stops, 0);
+        assert_eq!(
+            result.stage,
+            SimStage::Recording { latched: false },
+            "auto-repeat must never be mistaken for a double-tap"
         );
     }
 
@@ -510,12 +997,117 @@ mod tests {
         let mut events = autorepeat_burst();
         events.push(Ev::Release); // genuine key-up
         events.push(Ev::Grace); // grace window elapses, no cancelling press
-        let result = simulate(&events);
+        let result = simulate(&events, false);
         assert_eq!(result.starts, 1, "recording should start exactly once");
         assert_eq!(
             result.stops, 1,
             "a genuine release should stop recording exactly once"
         );
         assert_eq!(result.stage, SimStage::Processing);
+    }
+
+    /// The headline flow: tap, tap again inside the window, then speak freely.
+    /// Releasing the second tap must not stop anything, and the third press
+    /// ends the recording.
+    #[test]
+    fn double_tap_latches_and_next_press_stops() {
+        let events = [
+            Ev::Press,
+            Ev::Wait(90),
+            Ev::Release, // first tap ends -> deferred as a tap
+            Ev::Wait(120),
+            Ev::Press, // second tap inside the window -> latch
+            Ev::Wait(60),
+            Ev::Release,     // released while latched -> ignored
+            Ev::Wait(8_000), // hands-free dictation
+            Ev::Press,       // deliberate stop
+            Ev::Wait(80),
+            Ev::Release,
+        ];
+        let result = simulate(&events, true);
+        assert_eq!(result.starts, 1, "recording should start exactly once");
+        assert_eq!(
+            result.stops, 1,
+            "only the press after latching should stop the recording"
+        );
+        assert_eq!(result.stage, SimStage::Processing);
+    }
+
+    /// With the setting off, the identical key sequence is two ordinary
+    /// push-to-talk taps — proof the feature is inert until enabled.
+    #[test]
+    fn double_tap_does_not_latch_when_hands_free_is_disabled() {
+        let events = [
+            Ev::Press,
+            Ev::Wait(90),
+            Ev::Release,
+            Ev::Wait(120), // 50 ms grace elapses -> the first tap stops
+        ];
+        let result = simulate(&events, false);
+        assert_eq!(result.starts, 1);
+        assert_eq!(result.stops, 1);
+        assert_eq!(result.stage, SimStage::Processing);
+    }
+
+    /// A lone tap with hands-free on must still transcribe once the window
+    /// closes — the latch path must not strand a recording that never got a
+    /// second tap.
+    #[test]
+    fn single_tap_still_stops_after_the_double_tap_window() {
+        let events = [Ev::Press, Ev::Wait(90), Ev::Release, Ev::Wait(300)];
+        let result = simulate(&events, true);
+        assert_eq!(result.starts, 1);
+        assert_eq!(result.stops, 1);
+        assert_eq!(result.stage, SimStage::Processing);
+    }
+
+    /// A single tap whose second press arrives after the window closed — the
+    /// shape a descheduled coordinator produces, since it then dequeues the
+    /// press with `Ok` instead of waking on the deadline. The tap must still
+    /// transcribe, exactly as if the timer had fired on time.
+    #[test]
+    fn tap_still_stops_when_a_late_press_overtakes_the_deadline() {
+        let events = [
+            Ev::Press,
+            Ev::Wait(90),
+            Ev::Release,
+            Ev::Wait(310), // past DOUBLE_TAP_WINDOW: the stop is now due
+            Ev::Press,     // dequeued late, must not latch or swallow the stop
+        ];
+        let result = simulate(&events, true);
+        assert_eq!(result.starts, 1);
+        assert_eq!(
+            result.stops, 1,
+            "a late press must not discard the tap's pending stop"
+        );
+        assert_eq!(result.stage, SimStage::Processing);
+    }
+
+    /// The user latches by double-tapping but keeps the key held down, so X11
+    /// starts auto-repeating it. Those synthesized presses must not be read as
+    /// the deliberate press that ends a hands-free recording — otherwise
+    /// latching on X11 would stop the recording a moment later.
+    #[test]
+    fn autorepeat_while_latched_does_not_stop_recording() {
+        let mut events = vec![
+            Ev::Press,
+            Ev::Wait(90),
+            Ev::Release,
+            Ev::Wait(120),
+            Ev::Press,     // latches, and the key stays down
+            Ev::Wait(660), // auto-repeat delay
+        ];
+        for _ in 0..6 {
+            events.push(Ev::Release);
+            events.push(Ev::Press);
+            events.push(Ev::Wait(40));
+        }
+        let result = simulate(&events, true);
+        assert_eq!(result.starts, 1);
+        assert_eq!(
+            result.stops, 0,
+            "auto-repeat must not end a hands-free recording"
+        );
+        assert_eq!(result.stage, SimStage::Recording { latched: true });
     }
 }
