@@ -24,9 +24,9 @@ use tauri::{AppHandle, Emitter, Manager};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
 use crate::settings::{
-    self, get_settings, AutoSubmitKey, ClipboardHandling, KeyboardImplementation, LLMPrompt,
-    OverlayPosition, OverlayStyle, PasteMethod, ShortcutBinding, SoundTheme, Theme, TypingTool,
-    APPLE_INTELLIGENCE_PROVIDER_ID,
+    self, get_settings, AppSettings, AutoSubmitKey, ClipboardHandling, KeyboardImplementation,
+    LLMPrompt, OverlayPosition, OverlayStyle, PasteMethod, ShortcutBinding, SoundTheme, Theme,
+    TypingTool, APPLE_INTELLIGENCE_PROVIDER_ID,
 };
 use crate::tray;
 
@@ -473,7 +473,7 @@ pub fn resume_all_shortcuts(app: &AppHandle) {
         if is_dynamic_binding(id) {
             continue;
         }
-        if id == "transcribe_with_post_process" && !settings.post_process_enabled {
+        if id == "transcribe_with_post_process" && !settings.post_process_active() {
             continue;
         }
         if let Err(e) = register_shortcut(app, binding.clone()) {
@@ -665,7 +665,7 @@ fn register_all_shortcuts_for_implementation(
         }
 
         // Skip post-processing shortcut when the feature is disabled
-        if id == "transcribe_with_post_process" && !current_settings.post_process_enabled {
+        if id == "transcribe_with_post_process" && !current_settings.post_process_active() {
             continue;
         }
 
@@ -1205,22 +1205,26 @@ pub fn change_post_process_enabled_setting(app: AppHandle, enabled: bool) -> Res
     let mut settings = settings::get_settings(&app);
     settings.post_process_enabled = enabled;
     settings::write_settings(&app, settings.clone());
+    reconcile_post_process_shortcut(&app, &settings);
+    Ok(())
+}
 
-    // Register or unregister the post-processing shortcut
+/// Register or unregister the post-processing shortcut to match whether the
+/// feature is currently active (its own toggle AND the experimental gate).
+fn reconcile_post_process_shortcut(app: &AppHandle, settings: &AppSettings) {
     if let Some(binding) = settings
         .bindings
         .get("transcribe_with_post_process")
         .cloned()
     {
-        if enabled {
-            let _ = register_shortcut(&app, binding);
+        if settings.post_process_active() {
+            let _ = register_shortcut(app, binding);
         } else {
-            let _ = unregister_shortcut(&app, binding);
+            let _ = unregister_shortcut(app, binding);
         }
     }
 
-    crate::secure_input::reconcile_fallback(&app);
-    Ok(())
+    crate::secure_input::reconcile_fallback(app);
 }
 
 #[tauri::command]
@@ -1228,7 +1232,10 @@ pub fn change_post_process_enabled_setting(app: AppHandle, enabled: bool) -> Res
 pub fn change_experimental_enabled_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.experimental_enabled = enabled;
-    settings::write_settings(&app, settings);
+    settings::write_settings(&app, settings.clone());
+    // The experimental gate also turns post-processing (and its shortcut)
+    // on or off — it must not stay live once its section is hidden.
+    reconcile_post_process_shortcut(&app, &settings);
     Ok(())
 }
 

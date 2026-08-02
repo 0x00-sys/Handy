@@ -60,7 +60,12 @@ export const SECTIONS_CONFIG = {
     labelKey: "sidebar.postProcessing",
     icon: Sparkles,
     component: PostProcessingSettings,
-    enabled: (settings) => settings?.post_process_enabled ?? false,
+    // Post-processing is an experimental feature: turning the experimental
+    // section off disables it (and its shortcut), so its settings page has to
+    // disappear with it.
+    enabled: (settings) =>
+      (settings?.post_process_enabled && settings?.experimental_enabled) ??
+      false,
   },
   debug: {
     labelKey: "sidebar.debug",

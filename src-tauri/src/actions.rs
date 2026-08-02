@@ -649,7 +649,9 @@ impl ShortcutAction for TranscribeAction {
         play_feedback_sound(app, SoundType::Stop);
 
         let binding_id = binding_id.to_string(); // Clone binding_id for the async task
-        let post_process = self.post_process;
+                                                 // Gate at runtime too: CLI flags and signals can request post-processing
+                                                 // even while the feature (or the experimental section) is switched off.
+        let post_process = self.post_process && get_settings(app).post_process_active();
         let cancel_generation = rm.cancel_generation();
 
         tauri::async_runtime::spawn(async move {

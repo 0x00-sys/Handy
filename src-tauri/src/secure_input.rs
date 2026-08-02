@@ -518,7 +518,7 @@ mod imp {
                 if id == "cancel" && !state.cancel_requested.load(Ordering::SeqCst) {
                     continue;
                 }
-                if id == "transcribe_with_post_process" && !settings.post_process_enabled {
+                if id == "transcribe_with_post_process" && !settings.post_process_active() {
                     continue;
                 }
 

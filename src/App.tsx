@@ -52,6 +52,15 @@ function App() {
     checkOnboardingStatus();
   }, []);
 
+  // If the active section disappears from the sidebar (e.g. post-processing
+  // after experimental features are turned off), fall back to General instead
+  // of showing a page the user can no longer navigate to.
+  useEffect(() => {
+    if (settings && !SECTIONS_CONFIG[currentSection]?.enabled(settings)) {
+      setCurrentSection("general");
+    }
+  }, [settings, currentSection]);
+
   // Initialize RTL direction when language changes
   useEffect(() => {
     initializeRTL(i18n.language);
