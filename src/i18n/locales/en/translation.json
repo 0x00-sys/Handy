@@ -179,6 +179,10 @@
           "transcribe_with_post_process": {
             "name": "Post-Processing Hotkey",
             "description": "Optional: A dedicated hotkey that always applies AI post-processing to your transcription."
+          },
+          "hands_free": {
+            "name": "Hands-Free Key",
+            "description": "Pressed during a push-to-talk hold, keeps recording after you let go. Only active while you are holding the shortcut."
           }
         },
         "errors": {
@@ -197,6 +201,10 @@
       "pushToTalk": {
         "label": "Push To Talk",
         "description": "Hold to record, release to stop"
+      },
+      "pushToTalkHandsFree": {
+        "label": "Hands-Free Latch",
+        "description": "Double-tap the shortcut to keep recording after you let go. During a long hold, the overlay offers a key that does the same. Press the shortcut again to finish."
       }
     },
     "models": {
@@ -659,7 +667,8 @@
   },
   "overlay": {
     "transcribing": "Transcribing...",
-    "processing": "Processing..."
+    "processing": "Processing...",
+    "handsFree": "Hands-free"
   },
   "secureInput": {
     "blockedWithCulprit_one": "{{name}} may be blocking 1 shortcut",

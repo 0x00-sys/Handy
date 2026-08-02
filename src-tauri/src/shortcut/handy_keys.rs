@@ -428,9 +428,9 @@ pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
     let default_bindings = settings::get_default_settings().bindings;
     let user_settings = settings::load_or_create_app_settings(app);
 
-    // Register all bindings except cancel (which is dynamic)
+    // Register all bindings except the dynamic ones
     for (id, default_binding) in default_bindings {
-        if id == "cancel" {
+        if super::is_dynamic_binding(&id) {
             continue;
         }
         // Skip post-processing shortcut when the feature is disabled

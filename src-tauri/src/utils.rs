@@ -76,8 +76,9 @@ fn native_windows_machine() -> Option<u16> {
 pub fn cancel_current_operation(app: &AppHandle) {
     info!("Initiating operation cancellation...");
 
-    // Unregister the cancel shortcut asynchronously
+    // Unregister the dynamic shortcuts asynchronously
     shortcut::unregister_cancel_shortcut(app);
+    shortcut::unregister_hands_free_shortcut(app);
 
     // Cancel any ongoing recording
     let audio_manager = app.state::<Arc<AudioRecordingManager>>();

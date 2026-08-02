@@ -14,8 +14,11 @@ pub mod handy_keys;
 pub mod tauri_impl;
 
 use log::{debug, error, info, warn};
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use specta::Type;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -55,6 +58,18 @@ pub fn init_shortcuts(app: &AppHandle) {
     }
 }
 
+/// Modifier tokens recognised in a hotkey string.
+pub const MODIFIER_KEYS: [&str; 11] = [
+    "ctrl", "control", "shift", "alt", "option", "meta", "command", "cmd", "super", "win",
+    "windows",
+];
+
+/// Bindings that are registered only while a recording is in flight, so they
+/// are skipped everywhere the full set of shortcuts is registered in bulk.
+pub fn is_dynamic_binding(id: &str) -> bool {
+    id == "cancel" || id == "hands_free"
+}
+
 /// Register the cancel shortcut (called when recording starts)
 pub fn register_cancel_shortcut(app: &AppHandle) {
     // Track recording lifecycle independently of the current implementation so
@@ -79,22 +94,225 @@ pub fn unregister_cancel_shortcut(app: &AppHandle) {
     }
 }
 
-/// Register a shortcut using the appropriate implementation
-pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
-    let settings = get_settings(app);
-    match settings.keyboard_implementation {
+/// The hands-free hotkey currently registered, `None` whenever the key isn't
+/// live — which is also how the coordinator knows not to offer a hint the user
+/// couldn't act on.
+static ACTIVE_HANDS_FREE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+
+/// Bumped by every register/unregister request, always while `ACTIVE_HANDS_FREE`
+/// is held. Registration runs off-thread, so a recording that ends — or latches —
+/// before its registration lands would otherwise leave the hotkey claimed from
+/// every other app indefinitely; the spawned task compares epochs and undoes
+/// itself when stale.
+static HANDS_FREE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The key to show in the overlay's hands-free hint, if the hotkey is live.
+/// Only the main key: the composed hotkey's modifiers are the ones the user is
+/// already holding down.
+pub fn active_hands_free_key() -> Option<String> {
+    let hotkey = ACTIVE_HANDS_FREE.lock().ok()?.clone()?;
+    hotkey.rsplit('+').next().map(str::to_string)
+}
+
+/// Build the hotkey the hands-free key has to be registered as while
+/// `transcribe` is held. The transcribe shortcut's modifiers are still down when
+/// the user reaches for the hands-free key, so the OS reports them as part of
+/// that event and they have to be part of the registration.
+///
+/// Returns `None` when the two collide: the hands-free key cannot be the same
+/// key that is already holding the recording open.
+// Only reachable from the non-Linux registration path, but still exercised by
+// the unit tests on every platform.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn compose_hands_free_hotkey(transcribe: &str, hands_free: &str) -> Option<String> {
+    /// Split a hotkey into its modifiers and its main key. Left/right variants
+    /// normalise to the base modifier, which is all the OS reports as held.
+    fn split(hotkey: &str) -> (Vec<String>, Option<String>) {
+        let mut modifiers: Vec<String> = Vec::new();
+        let mut key = None;
+
+        for part in hotkey.split('+') {
+            let part = part.trim().to_lowercase();
+            if part.is_empty() {
+                continue;
+            }
+            let base = part
+                .trim_start_matches("left ")
+                .trim_start_matches("right ")
+                .trim_end_matches("_left")
+                .trim_end_matches("_right")
+                .to_string();
+
+            if base == "fn" || MODIFIER_KEYS.contains(&base.as_str()) {
+                if !modifiers.contains(&base) {
+                    modifiers.push(base);
+                }
+            } else {
+                key = Some(part);
+            }
+        }
+
+        (modifiers, key)
+    }
+
+    let (mut modifiers, transcribe_key) = split(transcribe);
+    let (hands_free_modifiers, hands_free_key) = split(hands_free);
+
+    let hands_free_key = hands_free_key?;
+    if transcribe_key.as_deref() == Some(hands_free_key.as_str()) {
+        return None;
+    }
+
+    for modifier in hands_free_modifiers {
+        if !modifiers.contains(&modifier) {
+            modifiers.push(modifier);
+        }
+    }
+    modifiers.push(hands_free_key);
+    Some(modifiers.join("+"))
+}
+
+/// Register the hands-free shortcut (called by the coordinator when a real
+/// push-to-talk hold begins recording), so the key is swallowed from the
+/// foreground app for no longer than the recording itself.
+pub fn register_hands_free_shortcut(app: &AppHandle, transcribe_binding_id: &str) {
+    // Disabled on Linux for the same reason as the cancel shortcut: dynamic
+    // registration is unstable there.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (app, transcribe_binding_id);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Claim an epoch before spawning, so an unregister that arrives while the
+        // registration is still in flight can invalidate it.
+        let epoch = match ACTIVE_HANDS_FREE.lock() {
+            Ok(_claim) => HANDS_FREE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1,
+            Err(_) => return,
+        };
+
+        // Everything below runs off-thread for the same reason as the cancel
+        // shortcut: registering from the shortcut callback itself can deadlock.
+        let app_clone = app.clone();
+        let transcribe_binding_id = transcribe_binding_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            let settings = get_settings(&app_clone);
+            let (Some(transcribe), Some(hands_free)) = (
+                settings.bindings.get(&transcribe_binding_id),
+                settings.bindings.get("hands_free"),
+            ) else {
+                return;
+            };
+
+            let Some(hotkey) =
+                compose_hands_free_hotkey(&transcribe.current_binding, &hands_free.current_binding)
+            else {
+                warn!(
+                    "Hands-free key '{}' collides with the transcribe shortcut '{}'; not registering",
+                    hands_free.current_binding, transcribe.current_binding
+                );
+                return;
+            };
+
+            let implementation = settings.keyboard_implementation;
+            let binding = ShortcutBinding {
+                current_binding: hotkey.clone(),
+                ..hands_free.clone()
+            };
+
+            if let Err(e) = register_shortcut_with(&app_clone, implementation, binding.clone()) {
+                error!("Failed to register hands-free shortcut: {}", e);
+                return;
+            }
+
+            // The hold may already have ended (or latched) while we were
+            // registering; its unregister found an empty slot and no-oped, so
+            // undo the registration here instead of leaving the hotkey claimed.
+            let stale = match ACTIVE_HANDS_FREE.lock() {
+                Ok(mut active) => {
+                    if HANDS_FREE_EPOCH.load(Ordering::SeqCst) == epoch {
+                        *active = Some(hotkey);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Err(_) => true,
+            };
+            if stale {
+                debug!("Hands-free registration landed after its recording ended; undoing it");
+                let _ = unregister_shortcut_with(&app_clone, implementation, binding);
+            }
+        });
+    }
+}
+
+/// Unregister the hands-free shortcut (called when recording stops, and as soon
+/// as a hold latches — once it has done its job the key belongs to the
+/// foreground app again). A no-op when the key was never registered.
+pub fn unregister_hands_free_shortcut(app: &AppHandle) {
+    let hotkey = {
+        let Ok(mut active) = ACTIVE_HANDS_FREE.lock() else {
+            return;
+        };
+        // Bumped under the same lock the registration task takes, so a
+        // registration still in flight recognises itself as stale.
+        HANDS_FREE_EPOCH.fetch_add(1, Ordering::SeqCst);
+        active.take()
+    };
+    let Some(hotkey) = hotkey else {
+        return;
+    };
+
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let settings = get_settings(&app_clone);
+        let Some(hands_free) = settings.bindings.get("hands_free") else {
+            return;
+        };
+        let binding = ShortcutBinding {
+            current_binding: hotkey,
+            ..hands_free.clone()
+        };
+        // We ignore errors here as it might already be unregistered
+        let _ = unregister_shortcut_with(&app_clone, settings.keyboard_implementation, binding);
+    });
+}
+
+/// Register with an already-known implementation, for callers that have just
+/// read settings and shouldn't pay for a second lookup.
+fn register_shortcut_with(
+    app: &AppHandle,
+    implementation: KeyboardImplementation,
+    binding: ShortcutBinding,
+) -> Result<(), String> {
+    match implementation {
         KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
         KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
     }
 }
 
-/// Unregister a shortcut using the appropriate implementation
-pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
-    let settings = get_settings(app);
-    match settings.keyboard_implementation {
+/// Unregister counterpart of [`register_shortcut_with`].
+fn unregister_shortcut_with(
+    app: &AppHandle,
+    implementation: KeyboardImplementation,
+    binding: ShortcutBinding,
+) -> Result<(), String> {
+    match implementation {
         KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
         KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
     }
+}
+
+/// Register a shortcut using the appropriate implementation
+pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
+    register_shortcut_with(app, get_settings(app).keyboard_implementation, binding)
+}
+
+/// Unregister a shortcut using the appropriate implementation
+pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
+    unregister_shortcut_with(app, get_settings(app).keyboard_implementation, binding)
 }
 
 // ============================================================================
@@ -149,9 +367,9 @@ pub fn change_binding(
         }
     };
 
-    // If this is the cancel binding, just update the settings and return
-    // It's managed dynamically, so we don't register/unregister here
-    if id == "cancel" {
+    // Dynamic bindings are registered only while a recording is in flight, so
+    // we just update the settings and return without registering here
+    if is_dynamic_binding(&id) {
         if let Some(mut b) = settings.bindings.get(&id).cloned() {
             b.current_binding = binding;
             settings.bindings.insert(id.clone(), b.clone());
@@ -230,11 +448,11 @@ pub fn reset_binding(app: AppHandle, id: String) -> Result<BindingResponse, Stri
 
 /// Unregister every binding while the user is recording a new shortcut in
 /// the UI, so no existing shortcut can fire — or swallow the keystrokes —
-/// mid-capture. The "cancel" binding is untouched: it is managed dynamically
-/// by the recording lifecycle.
+/// mid-capture. Dynamic bindings are untouched: they are managed by the
+/// recording lifecycle.
 pub fn suspend_all_shortcuts(app: &AppHandle) {
     for (id, binding) in settings::get_bindings(app) {
-        if id == "cancel" {
+        if is_dynamic_binding(&id) {
             continue;
         }
         if let Err(e) = unregister_shortcut(app, binding) {
@@ -252,7 +470,7 @@ pub fn suspend_all_shortcuts(app: &AppHandle) {
 pub fn resume_all_shortcuts(app: &AppHandle) {
     let settings = get_settings(app);
     for (id, binding) in &settings.bindings {
-        if id == "cancel" {
+        if is_dynamic_binding(id) {
             continue;
         }
         if id == "transcribe_with_post_process" && !settings.post_process_enabled {
@@ -412,8 +630,8 @@ fn unregister_all_shortcuts(app: &AppHandle, implementation: KeyboardImplementat
     let bindings = settings::get_bindings(app);
 
     for (id, binding) in bindings {
-        // Skip cancel shortcut as it's dynamically registered
-        if id == "cancel" {
+        // Skip dynamically registered shortcuts
+        if is_dynamic_binding(&id) {
             continue;
         }
 
@@ -441,8 +659,8 @@ fn register_all_shortcuts_for_implementation(
     let mut current_settings = settings::get_settings(app);
 
     for (id, default_binding) in &default_bindings {
-        // Skip cancel shortcut as it's dynamically registered
-        if id == "cancel" {
+        // Skip dynamically registered shortcuts
+        if is_dynamic_binding(id) {
             continue;
         }
 
@@ -529,6 +747,15 @@ fn initialize_handy_keys_with_rollback(app: &AppHandle) -> Result<bool, String> 
 pub fn change_ptt_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.push_to_talk = enabled;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_ptt_hands_free_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.push_to_talk_hands_free = enabled;
     settings::write_settings(&app, settings);
     Ok(())
 }
@@ -1339,4 +1566,71 @@ pub async fn get_available_accelerators() -> crate::managers::transcription::Ava
     tauri::async_runtime::spawn_blocking(crate::managers::transcription::get_available_accelerators)
         .await
         .expect("get_available_accelerators panicked")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_hands_free_hotkey;
+
+    /// The stock shortcuts hold a modifier down, so the hands-free key only
+    /// reaches us with that modifier attached.
+    #[test]
+    fn composes_with_the_modifiers_the_transcribe_shortcut_holds() {
+        assert_eq!(
+            compose_hands_free_hotkey("option+space", "tab").as_deref(),
+            Some("option+tab")
+        );
+        assert_eq!(
+            compose_hands_free_hotkey("ctrl+shift+space", "tab").as_deref(),
+            Some("ctrl+shift+tab")
+        );
+    }
+
+    /// A modifier-free shortcut (a spare key like f13) leaves the hands-free
+    /// key bare.
+    #[test]
+    fn composes_bare_when_the_transcribe_shortcut_has_no_modifiers() {
+        assert_eq!(
+            compose_hands_free_hotkey("f13", "space").as_deref(),
+            Some("space")
+        );
+    }
+
+    /// Left/right variants normalise: the OS only reports the base modifier as
+    /// held, so that is what has to be registered.
+    #[test]
+    fn normalizes_left_and_right_modifier_variants() {
+        assert_eq!(
+            compose_hands_free_hotkey("right option", "tab").as_deref(),
+            Some("option+tab")
+        );
+        assert_eq!(
+            compose_hands_free_hotkey("option_left+space", "tab").as_deref(),
+            Some("option+tab")
+        );
+    }
+
+    /// The hands-free key cannot be the key already holding the recording open
+    /// — pressing it again is indistinguishable from the hold itself.
+    #[test]
+    fn refuses_to_compose_when_the_keys_collide() {
+        assert_eq!(compose_hands_free_hotkey("option+space", "space"), None);
+        assert_eq!(compose_hands_free_hotkey("f13", "f13"), None);
+    }
+
+    /// A hands-free binding that is only modifiers has no key to press.
+    #[test]
+    fn refuses_to_compose_a_modifier_only_hands_free_key() {
+        assert_eq!(compose_hands_free_hotkey("option+space", "shift"), None);
+    }
+
+    /// Modifiers recorded on the hands-free binding itself are merged in
+    /// without duplicating the ones the hold already contributes.
+    #[test]
+    fn merges_modifiers_from_both_bindings_without_duplicates() {
+        assert_eq!(
+            compose_hands_free_hotkey("ctrl+space", "ctrl+shift+tab").as_deref(),
+            Some("ctrl+shift+tab")
+        );
+    }
 }

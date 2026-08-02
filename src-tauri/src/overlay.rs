@@ -633,6 +633,26 @@ pub fn update_overlay_enabled_cache(enabled: bool) {
     OVERLAY_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Offer the hands-free key in the overlay, once a push-to-talk hold has run
+/// long enough that a double-tap is no longer an option. Skipped when the
+/// overlay is disabled — nobody would see it, and a hidden overlay should not be
+/// fed events (see `emit_levels` and issue #1279).
+pub fn emit_hands_free_hint(app_handle: &AppHandle, key: &str) {
+    if !OVERLAY_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = app_handle.emit_to("recording_overlay", "hands-free-hint", key);
+}
+
+/// Tell the overlay the hold has latched, so it can show that the shortcut no
+/// longer has to be held and the next press ends the recording.
+pub fn emit_hands_free_active(app_handle: &AppHandle) {
+    if !OVERLAY_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = app_handle.emit_to("recording_overlay", "hands-free-active", ());
+}
+
 pub fn emit_levels(app_handle: &AppHandle, levels: &[f32]) {
     // Skip emission when the overlay is disabled. The recording_overlay
     // window is created at boot regardless of overlay_style, so without this
